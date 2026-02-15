@@ -1,0 +1,19 @@
+[project]
+name = "query-staff"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "langchain>=1.2.10",
+    "langchain-google-genai>=4.2.0",
+    "langgraph>=1.0.8",
+    "langsmith>=0.7.3",
+    "pymysql>=1.1.2",
+    "python-dotenv>=1.2.1",
+    "streamlit>=1.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.1",
+]
