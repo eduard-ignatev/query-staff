@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 import streamlit as st
 
 from agent import generate_query_plan, run_approved_query
+from database import get_schema_overview
 
 load_dotenv()
 
@@ -24,6 +25,35 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+
+@st.cache_data(ttl=300)
+def load_schema_overview() -> dict:
+    return get_schema_overview()
+
+
+with st.sidebar:
+    st.header("Schema Overview")
+    try:
+        overview = load_schema_overview()
+        st.caption(
+            f"Database: `{overview['database']}`  |  "
+            f"Tables: {overview['table_count']}"
+        )
+        for table in overview["tables"]:
+            with st.expander(table["table_name"], expanded=False):
+                st.markdown("**Columns**")
+                for col in table["columns"]:
+                    st.write(f"- `{col['column_name']}` ({col['data_type']})")
+                if table["foreign_keys"]:
+                    st.markdown("**Foreign Keys**")
+                    for fk in table["foreign_keys"]:
+                        st.write(
+                            f"- `{fk['column_name']}` -> "
+                            f"`{fk['referenced_table_name']}.{fk['referenced_column_name']}`"
+                        )
+    except Exception as exc:  # pragma: no cover
+        st.warning(f"Could not load schema overview: {exc}")
 
 query = st.text_area(
     "Question",

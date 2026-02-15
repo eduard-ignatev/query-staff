@@ -263,3 +263,33 @@ def _format_table_context(
         f"Columns:\n{chr(10).join(column_lines)}\n"
         f"Foreign Keys:\n{chr(10).join(fk_lines)}"
     )
+
+
+def get_schema_overview(
+    max_columns_per_table: int = 15,
+    config: DBConfig | None = None,
+) -> dict[str, Any]:
+    """Return a compact schema overview for sidebar display."""
+    with get_connection(config) as conn:
+        with conn.cursor() as cursor:
+            db_name = (config or load_db_config_from_env()).database
+            table_names = _fetch_table_names(cursor, db_name)
+            tables: list[dict[str, Any]] = []
+
+            for table_name in table_names:
+                columns = _fetch_columns(cursor, db_name, table_name, max_columns_per_table)
+                foreign_keys = _fetch_foreign_keys(cursor, db_name, table_name)
+                tables.append(
+                    {
+                        "table_name": table_name,
+                        "column_count": len(columns),
+                        "columns": columns,
+                        "foreign_keys": foreign_keys,
+                    }
+                )
+
+            return {
+                "database": db_name,
+                "table_count": len(tables),
+                "tables": tables,
+            }
