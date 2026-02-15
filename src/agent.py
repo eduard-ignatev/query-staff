@@ -11,7 +11,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import END, START, StateGraph
 
 from database import SQLExecutionError, SQLSafetyError, execute_readonly_query, get_schema_context, validate_sql
-from prompts import answer_synthesis_prompt, sql_correction_prompt, sql_generation_prompt
+from prompts import sql_correction_prompt, sql_generation_prompt
 
 load_dotenv()
 
@@ -116,22 +116,14 @@ def self_correct_node(state: AgentState) -> AgentState:
 
 def synthesize_answer_node(state: AgentState) -> AgentState:
     rows = state["execution_result"]
-    if not rows:
-        return {
-            **state,
-            "final_answer": "No matching data was found for your question.",
-        }
-
-    model = _build_model()
-    prompt = answer_synthesis_prompt(
-        user_query=state["user_query"],
-        sql=state["generated_sql"],
-        result_rows=rows,
-    )
-    response = model.invoke(prompt)
+    row_count = len(rows)
+    if row_count == 0:
+        message = "Query executed successfully. No rows returned."
+    else:
+        message = f"Query executed successfully. Returned {row_count} row(s)."
     return {
         **state,
-        "final_answer": _as_text(response.content),
+        "final_answer": message,
     }
 
 
@@ -198,8 +190,8 @@ def build_graph():
 _GRAPH = build_graph()
 
 
-def run_agent(user_query: str) -> AgentState:
-    initial_state: AgentState = {
+def _initial_state(user_query: str) -> AgentState:
+    return {
         "user_query": user_query,
         "schema_context": "",
         "generated_sql": "",
@@ -208,4 +200,37 @@ def run_agent(user_query: str) -> AgentState:
         "iteration_count": 0,
         "final_answer": "",
     }
-    return _GRAPH.invoke(initial_state)
+
+
+def generate_query_plan(user_query: str) -> AgentState:
+    """Generate and validate SQL without executing it."""
+    state = _initial_state(user_query)
+    state = retrieve_schema_node(state)
+    state = generate_sql_node(state)
+    state = validate_sql_node(state)
+    if state["execution_error"]:
+        state["final_answer"] = (
+            "I generated SQL but it failed safety validation. "
+            f"Error: {state['execution_error']}"
+        )
+    return state
+
+
+def run_approved_query(user_query: str, approved_sql: str) -> AgentState:
+    """Execute a user-approved SQL query and synthesize an answer."""
+    state = _initial_state(user_query)
+    state["generated_sql"] = approved_sql
+    state = validate_sql_node(state)
+    if state["execution_error"]:
+        return fail_gracefully_node(state)
+
+    state = execute_sql_node(state)
+    if state["execution_error"]:
+        return fail_gracefully_node(state)
+
+    return synthesize_answer_node(state)
+
+
+def run_agent(user_query: str) -> AgentState:
+    """Full automatic workflow with self-correction loop."""
+    return _GRAPH.invoke(_initial_state(user_query))

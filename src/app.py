@@ -5,13 +5,25 @@ from __future__ import annotations
 from dotenv import load_dotenv
 import streamlit as st
 
-from agent import run_agent
+from agent import generate_query_plan, run_approved_query
 
 load_dotenv()
 
 st.set_page_config(page_title="Query Staff", page_icon=":mag:", layout="centered")
 st.title("Query Staff")
 st.caption("Ask natural-language questions about the employees database.")
+st.markdown(
+    """
+    <style>
+    div[data-testid="stTextArea"] textarea {
+        font-family: "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        font-size: 0.9rem;
+        line-height: 1.4;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 query = st.text_area(
     "Question",
@@ -19,27 +31,80 @@ query = st.text_area(
     height=120,
 )
 
-run_clicked = st.button("Run Query", type="primary")
+if "generated_for_query" not in st.session_state:
+    st.session_state.generated_for_query = ""
+if "approved_sql" not in st.session_state:
+    st.session_state.approved_sql = ""
+if "last_state" not in st.session_state:
+    st.session_state.last_state = None
+
+
+if query.strip() != st.session_state.generated_for_query:
+    st.session_state.approved_sql = ""
+    st.session_state.last_state = None
+
+
+generate_clicked = st.button("Generate Query", use_container_width=True)
+
+if generate_clicked:
+    if not query.strip():
+        st.warning("Please enter a question first.")
+    else:
+        with st.spinner("Generating SQL..."):
+            state = generate_query_plan(query.strip())
+
+        st.session_state.generated_for_query = query.strip()
+        st.session_state.approved_sql = state["generated_sql"]
+        st.session_state.last_state = state
+
+        if state["execution_error"]:
+            st.error(state["execution_error"])
+        else:
+            st.success("Query generated. Review it, then click Run Query.")
+
+if st.session_state.approved_sql:
+    st.subheader("Review Generated SQL")
+    st.session_state.approved_sql = st.text_area(
+        "Generated SQL (editable)",
+        value=st.session_state.approved_sql,
+        height=200,
+        key="approved_sql_editor",
+    )
+
+run_clicked = st.button("Run Query", type="primary", use_container_width=True)
 
 if run_clicked:
     if not query.strip():
         st.warning("Please enter a question first.")
+    elif not st.session_state.approved_sql.strip():
+        st.warning("Generate a query first before running.")
+    elif query.strip() != st.session_state.generated_for_query:
+        st.warning("Question changed. Please click Generate Query again.")
     else:
-        with st.spinner("Generating SQL and running query..."):
-            final_state = run_agent(query.strip())
+        with st.spinner("Running approved SQL..."):
+            state = run_approved_query(query.strip(), st.session_state.approved_sql.strip())
+        st.session_state.last_state = state
 
-        st.subheader("Answer")
-        st.write(final_state["final_answer"])
+if st.session_state.last_state:
+    final_state = st.session_state.last_state
+    st.subheader("Result")
+    st.write(final_state["final_answer"])
 
-        with st.expander("Debug Details"):
-            st.markdown("**Generated SQL**")
-            st.code(final_state["generated_sql"], language="sql")
+    rows = final_state["execution_result"]
+    if rows:
+        st.dataframe(rows, use_container_width=True)
+    else:
+        st.info("No rows to display.")
 
-            st.markdown("**Iteration Count**")
-            st.write(final_state["iteration_count"])
+    with st.expander("Debug Details"):
+        st.markdown("**Generated SQL**")
+        st.code(final_state["generated_sql"], language="sql")
 
-            st.markdown("**Execution Error**")
-            st.write(final_state["execution_error"] or "<none>")
+        st.markdown("**Iteration Count**")
+        st.write(final_state["iteration_count"])
 
-            st.markdown("**Execution Result (rows)**")
-            st.write(final_state["execution_result"])
+        st.markdown("**Execution Error**")
+        st.write(final_state["execution_error"] or "<none>")
+
+        st.markdown("**Execution Result (rows)**")
+        st.write(final_state["execution_result"])
