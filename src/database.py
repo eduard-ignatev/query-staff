@@ -1,4 +1,4 @@
-"""Database access and SQL safety validation for the Text2SQL agent."""
+"""Database access, schema introspection, and SQL safety validation."""
 
 from __future__ import annotations
 
@@ -38,11 +38,16 @@ _AGGREGATE_ONLY_PATTERN = re.compile(
     r"^\s*select\s+(?:distinct\s+)?(?:count|sum|avg|min|max)\s*\(",
     re.IGNORECASE,
 )
+_LIMIT_PATTERN = re.compile(r"\blimit\b", re.IGNORECASE)
 _WORD_PATTERN = re.compile(r"\b[a-z_]+\b", re.IGNORECASE)
 
 
 class SQLSafetyError(ValueError):
     """Raised when SQL violates the read-only safety policy."""
+
+
+class SQLExecutionError(RuntimeError):
+    """Raised when SQL execution fails after passing safety validation."""
 
 
 @dataclass(frozen=True)
@@ -102,7 +107,7 @@ def validate_sql(sql: str) -> str:
     if banned_used:
         raise SQLSafetyError(f"Disallowed SQL keyword(s): {', '.join(banned_used)}.")
 
-    has_limit = " limit " in f" {normalized.lower()} "
+    has_limit = bool(_LIMIT_PATTERN.search(normalized))
     aggregate_only = bool(_AGGREGATE_ONLY_PATTERN.match(normalized))
     if not has_limit and not aggregate_only:
         raise SQLSafetyError("Non-aggregate queries must include a LIMIT clause.")
@@ -144,6 +149,117 @@ def execute_readonly_query(
         with conn.cursor() as cursor:
             cursor.execute("SET SESSION TRANSACTION READ ONLY")
             cursor.execute("SET SESSION max_execution_time = 30000")
-            cursor.execute(safe_sql, params)
+            try:
+                cursor.execute(safe_sql, params)
+            except pymysql.MySQLError as exc:
+                raise SQLExecutionError(str(exc)) from exc
             return list(cursor.fetchall())
 
+
+def get_schema_context(
+    user_query: str,
+    max_tables: int = 6,
+    max_columns_per_table: int = 20,
+    config: DBConfig | None = None,
+) -> str:
+    """Return targeted schema context for prompt grounding."""
+    keywords = _extract_keywords(user_query)
+    with get_connection(config) as conn:
+        with conn.cursor() as cursor:
+            db_name = (config or load_db_config_from_env()).database
+            table_names = _fetch_table_names(cursor, db_name)
+            ranked_tables = _rank_tables(table_names, keywords)
+            selected_tables = ranked_tables[:max_tables] if ranked_tables else table_names[:max_tables]
+
+            table_descriptions: list[str] = []
+            for table_name in selected_tables:
+                columns = _fetch_columns(cursor, db_name, table_name, max_columns_per_table)
+                foreign_keys = _fetch_foreign_keys(cursor, db_name, table_name)
+                table_descriptions.append(_format_table_context(table_name, columns, foreign_keys))
+
+            return "\n\n".join(table_descriptions)
+
+
+def _extract_keywords(text: str) -> set[str]:
+    return {word.lower() for word in _WORD_PATTERN.findall(text) if len(word) > 2}
+
+
+def _fetch_table_names(cursor: DictCursor, db_name: str) -> list[str]:
+    cursor.execute(
+        """
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = %s
+        ORDER BY table_name
+        """,
+        (db_name,),
+    )
+    return [row["table_name"] for row in cursor.fetchall()]
+
+
+def _fetch_columns(
+    cursor: DictCursor, db_name: str, table_name: str, max_columns: int
+) -> list[dict[str, str]]:
+    cursor.execute(
+        """
+        SELECT column_name, data_type, is_nullable, column_key
+        FROM information_schema.columns
+        WHERE table_schema = %s AND table_name = %s
+        ORDER BY ordinal_position
+        LIMIT %s
+        """,
+        (db_name, table_name, max_columns),
+    )
+    return list(cursor.fetchall())
+
+
+def _fetch_foreign_keys(cursor: DictCursor, db_name: str, table_name: str) -> list[dict[str, str]]:
+    cursor.execute(
+        """
+        SELECT
+            column_name,
+            referenced_table_name,
+            referenced_column_name
+        FROM information_schema.key_column_usage
+        WHERE table_schema = %s
+          AND table_name = %s
+          AND referenced_table_name IS NOT NULL
+        ORDER BY column_name
+        """,
+        (db_name, table_name),
+    )
+    return list(cursor.fetchall())
+
+
+def _rank_tables(table_names: list[str], keywords: set[str]) -> list[str]:
+    def score(name: str) -> tuple[int, int]:
+        tokens = set(_WORD_PATTERN.findall(name.lower()))
+        overlap = len(tokens.intersection(keywords))
+        # Keep deterministic ordering for equal scores.
+        return (overlap, -len(name))
+
+    return sorted(table_names, key=score, reverse=True)
+
+
+def _format_table_context(
+    table_name: str, columns: list[dict[str, str]], foreign_keys: list[dict[str, str]]
+) -> str:
+    column_lines = [
+        f"- {col['column_name']} ({col['data_type']}, nullable={col['is_nullable']}, key={col['column_key'] or 'NONE'})"
+        for col in columns
+    ]
+    if not column_lines:
+        column_lines = ["- <no columns found>"]
+
+    fk_lines = [
+        f"- {fk['column_name']} -> {fk['referenced_table_name']}.{fk['referenced_column_name']}"
+        for fk in foreign_keys
+    ]
+    if not fk_lines:
+        fk_lines = ["- <no foreign keys>"]
+
+    return (
+        f"Table: {table_name}\n"
+        f"Columns:\n{chr(10).join(column_lines)}\n"
+        f"Foreign Keys:\n{chr(10).join(fk_lines)}"
+    )
