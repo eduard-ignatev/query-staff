@@ -35,13 +35,16 @@ if "generated_for_query" not in st.session_state:
     st.session_state.generated_for_query = ""
 if "approved_sql" not in st.session_state:
     st.session_state.approved_sql = ""
-if "last_state" not in st.session_state:
-    st.session_state.last_state = None
+if "generated_state" not in st.session_state:
+    st.session_state.generated_state = None
+if "executed_state" not in st.session_state:
+    st.session_state.executed_state = None
 
 
 if query.strip() != st.session_state.generated_for_query:
     st.session_state.approved_sql = ""
-    st.session_state.last_state = None
+    st.session_state.generated_state = None
+    st.session_state.executed_state = None
 
 
 generate_clicked = st.button("Generate Query", use_container_width=True)
@@ -55,7 +58,8 @@ if generate_clicked:
 
         st.session_state.generated_for_query = query.strip()
         st.session_state.approved_sql = state["generated_sql"]
-        st.session_state.last_state = state
+        st.session_state.generated_state = state
+        st.session_state.executed_state = None
 
         if state["execution_error"]:
             st.error(state["execution_error"])
@@ -71,22 +75,36 @@ if st.session_state.approved_sql:
         key="approved_sql_editor",
     )
 
-run_clicked = st.button("Run Query", type="primary", use_container_width=True)
+    debug_state = st.session_state.executed_state or st.session_state.generated_state
+    if debug_state:
+        with st.expander("Debug Details"):
+            st.markdown("**Generated SQL**")
+            st.code(debug_state["generated_sql"], language="sql")
 
-if run_clicked:
-    if not query.strip():
-        st.warning("Please enter a question first.")
-    elif not st.session_state.approved_sql.strip():
-        st.warning("Generate a query first before running.")
-    elif query.strip() != st.session_state.generated_for_query:
-        st.warning("Question changed. Please click Generate Query again.")
-    else:
-        with st.spinner("Running approved SQL..."):
-            state = run_approved_query(query.strip(), st.session_state.approved_sql.strip())
-        st.session_state.last_state = state
+            st.markdown("**Iteration Count**")
+            st.write(debug_state["iteration_count"])
 
-if st.session_state.last_state:
-    final_state = st.session_state.last_state
+            st.markdown("**Execution Error**")
+            st.write(debug_state["execution_error"] or "<none>")
+
+            st.markdown("**Execution Result (rows)**")
+            st.write(debug_state["execution_result"])
+
+    run_clicked = st.button("Run Query", type="primary", use_container_width=True)
+    if run_clicked:
+        if not query.strip():
+            st.warning("Please enter a question first.")
+        elif not st.session_state.approved_sql.strip():
+            st.warning("Generate a query first before running.")
+        elif query.strip() != st.session_state.generated_for_query:
+            st.warning("Question changed. Please click Generate Query again.")
+        else:
+            with st.spinner("Running approved SQL..."):
+                state = run_approved_query(query.strip(), st.session_state.approved_sql.strip())
+            st.session_state.executed_state = state
+
+if st.session_state.executed_state:
+    final_state = st.session_state.executed_state
     st.subheader("Result")
     st.write(final_state["final_answer"])
 
@@ -95,16 +113,3 @@ if st.session_state.last_state:
         st.dataframe(rows, use_container_width=True)
     else:
         st.info("No rows to display.")
-
-    with st.expander("Debug Details"):
-        st.markdown("**Generated SQL**")
-        st.code(final_state["generated_sql"], language="sql")
-
-        st.markdown("**Iteration Count**")
-        st.write(final_state["iteration_count"])
-
-        st.markdown("**Execution Error**")
-        st.write(final_state["execution_error"] or "<none>")
-
-        st.markdown("**Execution Result (rows)**")
-        st.write(final_state["execution_result"])
