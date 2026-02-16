@@ -5,8 +5,13 @@ from __future__ import annotations
 from dotenv import load_dotenv
 import streamlit as st
 
-from agent import generate_query_plan, run_approved_query
-from database import get_schema_overview
+from agent import generate_query_plan
+from database import (
+    SQLExecutionError,
+    SQLSafetyError,
+    execute_readonly_query,
+    get_schema_overview,
+)
 
 load_dotenv()
 
@@ -91,8 +96,8 @@ if generate_clicked:
         st.session_state.generated_state = state
         st.session_state.executed_state = None
 
-        if state["execution_error"]:
-            st.error(state["execution_error"])
+        if state["validation_error"]:
+            st.error(state["validation_error"])
         else:
             st.success("Query generated. Review it, then click Run Query.")
 
@@ -111,14 +116,17 @@ if st.session_state.approved_sql:
             st.markdown("**Generated SQL**")
             st.code(debug_state["generated_sql"], language="sql")
 
+            st.markdown("**Generation Explanation**")
+            st.write(debug_state.get("generation_explanation", "") or "<none>")
+
+            st.markdown("**Correction Explanation**")
+            st.write(debug_state.get("correction_explanation", "") or "<none>")
+
             st.markdown("**Iteration Count**")
             st.write(debug_state["iteration_count"])
 
-            st.markdown("**Execution Error**")
-            st.write(debug_state["execution_error"] or "<none>")
-
-            st.markdown("**Execution Result (rows)**")
-            st.write(debug_state["execution_result"])
+            st.markdown("**Validation Error**")
+            st.write(debug_state.get("validation_error", "") or "<none>")
 
     run_clicked = st.button("Run Query", type="primary", use_container_width=True)
     if run_clicked:
@@ -130,15 +138,35 @@ if st.session_state.approved_sql:
             st.warning("Question changed. Please click Generate Query again.")
         else:
             with st.spinner("Running approved SQL..."):
-                state = run_approved_query(query.strip(), st.session_state.approved_sql.strip())
-            st.session_state.executed_state = state
+                sql = st.session_state.approved_sql.strip()
+                executed_state = {
+                    **(st.session_state.generated_state or {}),
+                    "generated_sql": sql,
+                    "execution_result": [],
+                    "execution_error": "",
+                    "final_answer": "",
+                }
+                try:
+                    rows = execute_readonly_query(sql)
+                    executed_state["execution_result"] = rows
+                    executed_state["final_answer"] = (
+                        "Query executed successfully. "
+                        f"Returned {len(rows)} row(s)."
+                    )
+                except SQLSafetyError as exc:
+                    executed_state["execution_error"] = str(exc)
+                    executed_state["final_answer"] = f"Query blocked by safety policy: {exc}"
+                except SQLExecutionError as exc:
+                    executed_state["execution_error"] = str(exc)
+                    executed_state["final_answer"] = f"Query execution failed: {exc}"
+            st.session_state.executed_state = executed_state
 
 if st.session_state.executed_state:
     final_state = st.session_state.executed_state
     st.subheader("Result")
     st.write(final_state["final_answer"])
 
-    rows = final_state["execution_result"]
+    rows = final_state.get("execution_result", [])
     if rows:
         st.dataframe(rows, use_container_width=True)
     else:

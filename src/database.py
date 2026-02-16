@@ -158,18 +158,17 @@ def execute_readonly_query(
 
 def get_schema_context(
     user_query: str,
-    max_tables: int = 6,
+    max_tables: int | None = None,
     max_columns_per_table: int = 20,
     config: DBConfig | None = None,
 ) -> str:
-    """Return targeted schema context for prompt grounding."""
-    keywords = _extract_keywords(user_query)
+    """Return schema context for prompt grounding."""
+    del user_query
     with get_connection(config) as conn:
         with conn.cursor() as cursor:
             db_name = (config or load_db_config_from_env()).database
             table_names = _fetch_table_names(cursor, db_name)
-            ranked_tables = _rank_tables(table_names, keywords)
-            selected_tables = ranked_tables[:max_tables] if ranked_tables else table_names[:max_tables]
+            selected_tables = table_names if max_tables is None else table_names[:max_tables]
 
             table_descriptions: list[str] = []
             for table_name in selected_tables:
@@ -178,10 +177,6 @@ def get_schema_context(
                 table_descriptions.append(_format_table_context(table_name, columns, foreign_keys))
 
             return "\n\n".join(table_descriptions)
-
-
-def _extract_keywords(text: str) -> set[str]:
-    return {word.lower() for word in _WORD_PATTERN.findall(text) if len(word) > 2}
 
 
 def _fetch_table_names(cursor: DictCursor, db_name: str) -> list[str]:
@@ -229,16 +224,6 @@ def _fetch_foreign_keys(cursor: DictCursor, db_name: str, table_name: str) -> li
         (db_name, table_name),
     )
     return list(cursor.fetchall())
-
-
-def _rank_tables(table_names: list[str], keywords: set[str]) -> list[str]:
-    def score(name: str) -> tuple[int, int]:
-        tokens = set(_WORD_PATTERN.findall(name.lower()))
-        overlap = len(tokens.intersection(keywords))
-        # Keep deterministic ordering for equal scores.
-        return (overlap, -len(name))
-
-    return sorted(table_names, key=score, reverse=True)
 
 
 def _format_table_context(

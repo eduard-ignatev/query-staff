@@ -1,16 +1,16 @@
-"""LangGraph workflow for the Text2SQL MVP."""
+"""LangGraph workflow for SQL generation, validation, and self-correction."""
 
 from __future__ import annotations
 
+import json
 import os
-import re
-from typing import Any, TypedDict
+from typing import TypedDict
 
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import END, START, StateGraph
 
-from database import SQLExecutionError, SQLSafetyError, execute_readonly_query, get_schema_context, validate_sql
+from database import SQLSafetyError, get_schema_context, validate_sql
 from prompts import sql_correction_prompt, sql_generation_prompt
 
 load_dotenv()
@@ -23,10 +23,15 @@ class AgentState(TypedDict):
     user_query: str
     schema_context: str
     generated_sql: str
-    execution_result: list[dict[str, Any]]
-    execution_error: str
+    generation_explanation: str
+    validation_error: str
+    correction_explanation: str
     iteration_count: int
-    final_answer: str
+
+
+class StructuredSQLResponse(TypedDict):
+    explanation: str
+    sql_query: str
 
 
 def _build_model() -> ChatGoogleGenerativeAI:
@@ -36,7 +41,7 @@ def _build_model() -> ChatGoogleGenerativeAI:
     )
 
 
-def _as_text(content: Any) -> str:
+def _as_text(content: object) -> str:
     if isinstance(content, str):
         return content.strip()
     if isinstance(content, list):
@@ -52,101 +57,94 @@ def _as_text(content: Any) -> str:
     return str(content).strip()
 
 
-def _extract_sql(text: str) -> str:
-    text = text.strip()
-    fenced = re.search(r"```(?:sql)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
-    if fenced:
-        return fenced.group(1).strip()
-    return text
+def _extract_json_block(text: str) -> str:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = stripped.strip("`")
+        if stripped.lower().startswith("json"):
+            stripped = stripped[4:].strip()
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("Model response did not contain a JSON object.")
+    return stripped[start : end + 1]
+
+
+def _invoke_structured_sql(prompt: str) -> StructuredSQLResponse:
+    model = _build_model()
+    response = model.invoke(prompt)
+    raw_text = _as_text(response.content)
+    payload = json.loads(_extract_json_block(raw_text))
+    explanation = str(payload.get("explanation", "")).strip()
+    sql_query = str(payload.get("sql_query", "")).strip()
+    if not explanation or not sql_query:
+        raise ValueError("Structured output must include non-empty 'explanation' and 'sql_query'.")
+    return {"explanation": explanation, "sql_query": sql_query}
 
 
 def retrieve_schema_node(state: AgentState) -> AgentState:
-    schema_context = get_schema_context(state["user_query"])
-    return {**state, "schema_context": schema_context, "execution_error": ""}
+    return {
+        **state,
+        "schema_context": get_schema_context(state["user_query"]),
+        "validation_error": "",
+    }
 
 
 def generate_sql_node(state: AgentState) -> AgentState:
-    model = _build_model()
-    prompt = sql_generation_prompt(state["user_query"], state["schema_context"])
-    response = model.invoke(prompt)
-    sql = _extract_sql(_as_text(response.content))
-    return {**state, "generated_sql": sql, "execution_error": ""}
+    structured = _invoke_structured_sql(
+        sql_generation_prompt(state["user_query"], state["schema_context"])
+    )
+    return {
+        **state,
+        "generated_sql": structured["sql_query"],
+        "generation_explanation": structured["explanation"],
+        "validation_error": "",
+    }
 
 
 def validate_sql_node(state: AgentState) -> AgentState:
     try:
-        normalized = validate_sql(state["generated_sql"])
-        return {**state, "generated_sql": normalized, "execution_error": ""}
+        normalized_sql = validate_sql(state["generated_sql"])
+        return {
+            **state,
+            "generated_sql": normalized_sql,
+            "validation_error": "",
+        }
     except SQLSafetyError as exc:
         return {
             **state,
-            "execution_error": f"SQL safety validation failed: {exc}",
-            "iteration_count": state["iteration_count"] + 1,
-        }
-
-
-def execute_sql_node(state: AgentState) -> AgentState:
-    try:
-        rows = execute_readonly_query(state["generated_sql"])
-        return {
-            **state,
-            "execution_result": rows,
-            "execution_error": "",
-        }
-    except SQLExecutionError as exc:
-        return {
-            **state,
-            "execution_error": f"SQL execution failed: {exc}",
+            "validation_error": f"SQL safety validation failed: {exc}",
             "iteration_count": state["iteration_count"] + 1,
         }
 
 
 def self_correct_node(state: AgentState) -> AgentState:
-    model = _build_model()
-    prompt = sql_correction_prompt(
-        user_query=state["user_query"],
-        schema_context=state["schema_context"],
-        failed_sql=state["generated_sql"],
-        execution_error=state["execution_error"],
+    structured = _invoke_structured_sql(
+        sql_correction_prompt(
+            user_query=state["user_query"],
+            schema_context=state["schema_context"],
+            failed_sql=state["generated_sql"],
+            validation_error=state["validation_error"],
+        )
     )
-    response = model.invoke(prompt)
-    fixed_sql = _extract_sql(_as_text(response.content))
-    return {**state, "generated_sql": fixed_sql}
-
-
-def synthesize_answer_node(state: AgentState) -> AgentState:
-    rows = state["execution_result"]
-    row_count = len(rows)
-    if row_count == 0:
-        message = "Query executed successfully. No rows returned."
-    else:
-        message = f"Query executed successfully. Returned {row_count} row(s)."
     return {
         **state,
-        "final_answer": message,
+        "generated_sql": structured["sql_query"],
+        "correction_explanation": structured["explanation"],
     }
+
+
+def success_node(state: AgentState) -> AgentState:
+    return state
 
 
 def fail_gracefully_node(state: AgentState) -> AgentState:
-    return {
-        **state,
-        "final_answer": (
-            "I could not produce a valid query after multiple attempts. "
-            f"Last error: {state['execution_error']} "
-            "Please rephrase the question with table names or clearer filters."
-        ),
-    }
+    return state
 
 
 def route_after_validate(state: AgentState) -> str:
-    if state["execution_error"]:
-        return "fail" if state["iteration_count"] >= MAX_ITERATIONS else "self_correct"
-    return "execute"
-
-
-def route_after_execute(state: AgentState) -> str:
-    if not state["execution_error"]:
-        return "synthesize"
+    if not state["validation_error"]:
+        return "success"
     return "fail" if state["iteration_count"] >= MAX_ITERATIONS else "self_correct"
 
 
@@ -155,9 +153,8 @@ def build_graph():
     graph.add_node("retrieve_schema", retrieve_schema_node)
     graph.add_node("generate_sql", generate_sql_node)
     graph.add_node("validate_sql", validate_sql_node)
-    graph.add_node("execute_sql", execute_sql_node)
     graph.add_node("self_correct", self_correct_node)
-    graph.add_node("synthesize_answer", synthesize_answer_node)
+    graph.add_node("success", success_node)
     graph.add_node("fail_gracefully", fail_gracefully_node)
 
     graph.add_edge(START, "retrieve_schema")
@@ -167,27 +164,18 @@ def build_graph():
         "validate_sql",
         route_after_validate,
         {
-            "execute": "execute_sql",
-            "self_correct": "self_correct",
-            "fail": "fail_gracefully",
-        },
-    )
-    graph.add_conditional_edges(
-        "execute_sql",
-        route_after_execute,
-        {
-            "synthesize": "synthesize_answer",
+            "success": "success",
             "self_correct": "self_correct",
             "fail": "fail_gracefully",
         },
     )
     graph.add_edge("self_correct", "validate_sql")
-    graph.add_edge("synthesize_answer", END)
+    graph.add_edge("success", END)
     graph.add_edge("fail_gracefully", END)
     return graph.compile()
 
 
-_GRAPH = build_graph()
+_PLAN_GRAPH = build_graph()
 
 
 def _initial_state(user_query: str) -> AgentState:
@@ -195,42 +183,13 @@ def _initial_state(user_query: str) -> AgentState:
         "user_query": user_query,
         "schema_context": "",
         "generated_sql": "",
-        "execution_result": [],
-        "execution_error": "",
+        "generation_explanation": "",
+        "validation_error": "",
+        "correction_explanation": "",
         "iteration_count": 0,
-        "final_answer": "",
     }
 
 
 def generate_query_plan(user_query: str) -> AgentState:
-    """Generate and validate SQL without executing it."""
-    state = _initial_state(user_query)
-    state = retrieve_schema_node(state)
-    state = generate_sql_node(state)
-    state = validate_sql_node(state)
-    if state["execution_error"]:
-        state["final_answer"] = (
-            "I generated SQL but it failed safety validation. "
-            f"Error: {state['execution_error']}"
-        )
-    return state
-
-
-def run_approved_query(user_query: str, approved_sql: str) -> AgentState:
-    """Execute a user-approved SQL query and synthesize an answer."""
-    state = _initial_state(user_query)
-    state["generated_sql"] = approved_sql
-    state = validate_sql_node(state)
-    if state["execution_error"]:
-        return fail_gracefully_node(state)
-
-    state = execute_sql_node(state)
-    if state["execution_error"]:
-        return fail_gracefully_node(state)
-
-    return synthesize_answer_node(state)
-
-
-def run_agent(user_query: str) -> AgentState:
-    """Full automatic workflow with self-correction loop."""
-    return _GRAPH.invoke(_initial_state(user_query))
+    """Generate a validated SQL plan (no execution)."""
+    return _PLAN_GRAPH.invoke(_initial_state(user_query))

@@ -1,7 +1,7 @@
 # AGENTS.md: Text2SQL Agent Project Instructions
 
 ## Objective
-Build an AI agent that translates natural-language questions into SQL, executes against MySQL, and returns a clear natural-language answer. The design should follow a stateful, self-correcting workflow inspired by Uber Query-GPT.
+Build an AI agent that translates natural-language questions into SQL for user review, then allows approved SQL execution against MySQL from Streamlit. The design should follow a stateful, self-correcting workflow inspired by Uber Query-GPT.
 
 ## Scope
 - This is a MVP focused on correctness and safety.
@@ -20,24 +20,28 @@ Build an AI agent that translates natural-language questions into SQL, executes 
 - **Containerization:** Docker + Docker Compose
 
 ## Agent Architecture
-Implement an iterative LangGraph workflow, not a single zero-shot prompt.
+Implement an iterative self-correcting workflow for SQL generation and validation. SQL execution is handled by the Streamlit layer after user approval.
 
 ### State Definition (`TypedDict`)
 - `user_query`: original natural-language query
-- `schema_context`: relevant schema snippets used for SQL generation
+- `schema_context`: schema context used for SQL generation
 - `generated_sql`: latest SQL query
-- `execution_result`: raw rows/columns from DB on success
-- `execution_error`: DB or SQL error on failure
+- `generation_explanation`: brief rationale from the model for generated SQL
+- `validation_error`: SQL safety/validation error message
+- `correction_explanation`: brief rationale from the model for corrected SQL
 - `iteration_count`: retry counter for self-correction
-- `final_answer`: user-facing answer
+- `final_answer`: terminal status message for generation/correction flow
 
 ### Required Nodes and Routing
 1. **Retrieve Schema**
-   - Fetch only relevant schema context.
-   - Prefer targeted retrieval over full-schema dumps.
+   - Load schema context for SQL generation.
+   - Full schema loading is acceptable for this sample database.
 
 2. **Generate SQL**
    - Produce valid MySQL SQL using `user_query` + `schema_context`.
+   - Must return structured output with:
+     - `explanation`
+     - `sql_query`
 
 3. **Validate SQL (Safety Gate)**
    - Enforce read-only policy before execution.
@@ -45,24 +49,25 @@ Implement an iterative LangGraph workflow, not a single zero-shot prompt.
    - Require a bounded result pattern (`LIMIT` unless aggregation-only query).
    - Ensure single statement only.
 
-4. **Execute SQL**
-   - Execute validated SQL.
-   - On success: store `execution_result` and route to **Synthesize Answer**.
-   - On failure: store `execution_error` and route to **Self-Correct**.
+4. **Self-Correct (Reflection)**
+   - Triggered when validation fails.
+   - Use validation error + failed SQL to generate a fixed SQL query.
+   - Must return structured output with:
+     - `explanation`
+     - `sql_query`
+   - Increment `iteration_count` and retry validation.
+   - Maximum retries: 3.
 
-5. **Self-Correct (Reflection)**
-   - Use `execution_error` + failed SQL to generate a fixed SQL query.
-   - Increment `iteration_count` and retry execution.
-   - Maximum retries: 3 total execution attempts.
-
-6. **Fail Gracefully (Terminal)**
+5. **Fail Gracefully (Terminal)**
    - If all retries fail, set `final_answer` with:
      - a concise explanation,
-     - why the query failed,
+     - why validation failed,
      - what the user can rephrase.
 
-7. **Synthesize Answer**
-   - Convert `execution_result` into a helpful response grounded in returned data only.
+## Execution Boundary
+- Query execution is not an agent node.
+- Streamlit executes SQL only after explicit user approval (`Generate Query` -> review/edit -> `Run Query`).
+- Query result rendering is tabular UI output, not LLM synthesis.
 
 ## SQL Safety Requirements (Non-Negotiable)
 - Strictly read-only DB credentials.
@@ -71,26 +76,17 @@ Implement an iterative LangGraph workflow, not a single zero-shot prompt.
 - Never execute raw user SQL directly.
 - Log rejected SQL with reason for debugging.
 
-## Schema Retrieval Strategy
-- Rank candidate tables using query keyword overlap on:
-  - table names,
-  - column names,
-  - lightweight table descriptions if available.
-- Keep retrieved schema under a practical context budget.
-- Include join hints from foreign keys when possible.
-
-## Answer Contract
-`final_answer` should:
-- answer the question directly,
-- include key values and units when relevant,
-- mention when results are empty,
-- avoid unsupported claims beyond the SQL result.
+## Structured Output Contract (Required)
+Both SQL generation and SQL correction model calls must return structured output:
+- `explanation`: short natural-language rationale (for user/debug visibility).
+- `sql_query`: single MySQL `SELECT` statement candidate.
 
 ## MVP Definition of Done
 - Dockerized app boots with one command.
-- End-to-end flow works: NL query -> SQL -> execution -> answer.
-- Reflection loop works for at least one failed-then-fixed query.
+- End-to-end flow works: NL query -> Generate Query -> user review/edit -> Run Query -> table output.
+- Reflection loop works for at least one validation-failed-then-fixed query.
 - Read-only safety gate blocks disallowed SQL patterns.
+- Structured output (`explanation`, `sql_query`) is enforced for generation and correction calls.
 - Basic lint checks pass (`ruff`).
 
 ## Evaluation Plan
@@ -115,9 +111,9 @@ The application must run entirely through Docker Compose.
 ├── .env                    # Secret variables
 ├── src/
 │   ├── app.py              # Streamlit UI
-│   ├── agent.py            # LangGraph workflow definition
+│   ├── agent.py            # SQL generation/validation/correction workflow
 │   ├── database.py         # Database connection logic and safety validation
-│   └── prompts.py          # Prompt templates for SQL and synthesis
+│   └── prompts.py          # Prompt templates for SQL generation/correction
 └── AGENTS.md
 ```
 

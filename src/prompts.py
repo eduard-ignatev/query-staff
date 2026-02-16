@@ -1,4 +1,4 @@
-"""Prompt builders for SQL generation, correction, and synthesis."""
+"""Prompt builders for SQL generation and correction."""
 
 from __future__ import annotations
 
@@ -6,13 +6,18 @@ from __future__ import annotations
 SQL_POLICY = """You are a MySQL Text2SQL assistant.
 
 Hard rules:
-- Return exactly one SQL statement.
+- Return exactly one SQL statement in the `sql_query` field.
 - Only SELECT is allowed.
 - Never use INSERT, UPDATE, DELETE, REPLACE, ALTER, DROP, TRUNCATE, CREATE, GRANT, REVOKE.
 - Use only tables/columns from the provided schema context.
 - Prefer explicit JOIN conditions.
 - For non-aggregate queries, include LIMIT 100 or lower.
-- Do not include explanations outside SQL.
+
+Output format:
+- Return strict JSON with exactly two keys:
+  - "explanation": short rationale for query design
+  - "sql_query": the SQL statement
+- Do not include markdown fences or any extra text.
 """
 
 
@@ -25,12 +30,12 @@ Schema context:
 User question:
 {user_query}
 
-Output only SQL.
+Produce structured JSON output only.
 """
 
 
 def sql_correction_prompt(
-    user_query: str, schema_context: str, failed_sql: str, execution_error: str
+    user_query: str, schema_context: str, failed_sql: str, validation_error: str
 ) -> str:
     return f"""{SQL_POLICY}
 
@@ -44,28 +49,8 @@ Schema context:
 Failed SQL:
 {failed_sql}
 
-Error:
-{execution_error}
+Validation error:
+{validation_error}
 
-Produce a corrected SQL statement only.
-"""
-
-
-def answer_synthesis_prompt(user_query: str, sql: str, result_rows: list[dict]) -> str:
-    return f"""You are answering a user question from SQL query results.
-
-Rules:
-- Be concise and direct.
-- Use only facts from the provided rows.
-- If rows are empty, say no matching data was found.
-- Mention key values from the result.
-
-User question:
-{user_query}
-
-Executed SQL:
-{sql}
-
-Rows:
-{result_rows}
+Produce corrected structured JSON output only.
 """
